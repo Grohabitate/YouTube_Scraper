@@ -2,3 +2,4 @@ flask
 youtube-transcript-api
 openai
 gunicorn
+python-dotenv
