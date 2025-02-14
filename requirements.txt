@@ -31,6 +31,8 @@ distro==1.9.0
     # via openai
 flask==3.1.0
     # via -r requirements.in
+gunicorn==23.0.0
+    # via -r requirements.in
 h11==0.14.0
     # via httpcore
 httpcore==1.0.7
@@ -54,6 +56,8 @@ markupsafe==3.0.2
     #   werkzeug
 openai==1.63.0
     # via -r requirements.in
+packaging==24.2
+    # via gunicorn
 pydantic==2.10.6
     # via openai
 pydantic-core==2.27.2
