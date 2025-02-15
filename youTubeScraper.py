@@ -1,69 +1,89 @@
-from flask import Flask, jsonify
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from flask import Flask, jsonify, request
 import openai
 import os
 from dotenv import load_dotenv
 import urllib.parse
-import requests
+
+# Selenium imports
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Create an OpenAI client instance (as in your working code)
+# Create an OpenAI client instance (using your API key)
 client = openai.Client(api_key=os.getenv("OPENAI_ACCESS"))
 
-# Define custom headers to mimic a browser and help prevent blocking by YouTube
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
-}
-
-# Create a custom Requests session and update its headers
-custom_session = requests.Session()
-custom_session.headers.update(HEADERS)
-# Monkey-patch the default requests.request so that all calls use our custom headers
-requests.request = custom_session.request
-
-# Hardcoded YouTube URL for testing (use your own video URL here)
-YOUTUBE_URL = "https://www.youtube.com/watch?v=4vIl4G3-yk8"
-
-@app.route("/summarize_youtube", methods=["GET"])  # Using GET since URL is hardcoded
-def summarize_youtube():
+def get_youtube_transcript(video_url):
     """
-    Fetches the transcript from a hardcoded YouTube URL, processes it,
-    and returns a summary and tags using OpenAI.
+    Uses Selenium with headless Chrome to load a YouTube video page,
+    click the "More actions" button and "Open transcript", and then
+    scrape the transcript text.
     """
-    print("Using hardcoded YouTube URL:", YOUTUBE_URL)
-
-    # 1. Extract Video ID
-    parsed = urllib.parse.urlparse(YOUTUBE_URL)
-    video_id = urllib.parse.parse_qs(parsed.query).get("v")
-    if not video_id:
-        return jsonify({"error": "Invalid YouTube URL or missing ?v= parameter"}), 400
-    video_id = video_id[0]
-    print("Extracted video ID:", video_id)
-
-    # 2. Get Transcript (Handling Errors)
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")  # Run in headless mode
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36"
+    )
+    
+    # Initialize ChromeDriver (ensure chromedriver is in your PATH)
+    driver = webdriver.Chrome(options=chrome_options)
+    
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        print("✅ Transcript successfully retrieved.")
-    except TranscriptsDisabled:
-        return jsonify({"error": "Subtitles are disabled for this video. No transcript is available."}), 400
-    except NoTranscriptFound:
-        return jsonify({"error": "Transcript exists but is not accessible via the API."}), 400
+        driver.get(video_url)
+        # Wait for the "More actions" button and click it
+        more_button = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[@aria-label='More actions']"))
+        )
+        more_button.click()
+        
+        # Wait for the "Open transcript" option to appear and click it
+        transcript_option = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.XPATH, "//yt-formatted-string[text()='Open transcript']"))
+        )
+        transcript_option.click()
+        
+        # Wait for the transcript panel to load and get all transcript lines
+        transcript_lines = WebDriverWait(driver, 15).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ytd-transcript-renderer #segments yt-formatted-string"))
+        )
+        transcript_text = "\n".join([line.text for line in transcript_lines])
+        return transcript_text
     except Exception as e:
-        return jsonify({"error": f"Could not retrieve transcript: {str(e)}"}), 400
+        print("Error retrieving transcript via Selenium:", e)
+        return None
+    finally:
+        driver.quit()
 
-    # 3. Combine transcript text
-    transcript_text = "\n".join([line["text"] for line in transcript])
-
-    # 4. Call OpenAI for Summary using "gpt-3.5-turbo" via the client instance
+@app.route("/summarize_youtube", methods=["GET"])
+def summarize_youtube_endpoint():
+    """
+    Endpoint that retrieves the transcript from a YouTube video using Selenium,
+    then uses OpenAI to generate a summary and tags.
+    Accepts a query parameter "url"; if not provided, uses a default URL.
+    """
+    # Get the YouTube URL from query parameters or use a default
+    video_url = request.args.get("url", "https://www.youtube.com/watch?v=YOUR_DEFAULT_VIDEO_ID")
+    print("Processing video URL:", video_url)
+    
+    # Use Selenium to get the transcript
+    transcript_text = get_youtube_transcript(video_url)
+    if not transcript_text:
+        return jsonify({"error": "Failed to retrieve transcript via Selenium."}), 400
+    
+    # Use OpenAI to generate a summary
     summary = "Summary generation failed."
     try:
         summary_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."},
+                {"role": "system", "content": "You are an expert analyst who summarizes YouTube videos."},
                 {"role": "assistant", "content": "Write a 100-word summary of this video."},
                 {"role": "user", "content": transcript_text}
             ]
@@ -71,15 +91,15 @@ def summarize_youtube():
         summary = summary_response.choices[0].message.content.strip()
         print("✅ Summary generated.")
     except Exception as e:
-        print("⚠️ OpenAI Summary API failed:", str(e))
+        print("⚠️ OpenAI Summary API error:", e)
     
-    # 5. Call OpenAI for Tags using "gpt-3.5-turbo" via the client instance
+    # Use OpenAI to generate tags
     tags = "Tag generation failed."
     try:
         tags_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."},
+                {"role": "system", "content": "You are an expert analyst who generates blog tags."},
                 {"role": "assistant", "content": "Output a list of tags for this blog post in a Python list, like ['item1','item2','item3']."},
                 {"role": "user", "content": transcript_text}
             ]
@@ -87,17 +107,16 @@ def summarize_youtube():
         tags = tags_response.choices[0].message.content.strip()
         print("✅ Tags generated.")
     except Exception as e:
-        print("⚠️ OpenAI Tags API failed:", str(e))
-
-    # 6. Return JSON result
+        print("⚠️ OpenAI Tags API error:", e)
+    
+    # Return the results as JSON
     return jsonify({
+        "transcript": transcript_text,
         "summary": summary,
-        "tags": tags,
-        "transcript": transcript_text
+        "tags": tags
     })
 
 if __name__ == "__main__":
     port = 5000
     print(f"🚀 Flask API is running! Open: http://127.0.0.1:{port}/summarize_youtube")
     app.run(port=port, debug=True)
-
