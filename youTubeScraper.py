@@ -1,109 +1,103 @@
-from flask import Flask, request, jsonify
-from youtube_transcript_api import YouTubeTranscriptApi
+from flask import Flask, jsonify
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import openai
 import os
 from dotenv import load_dotenv
+import urllib.parse
+import requests
 
 load_dotenv()
 
 app = Flask(__name__)
 
-openai.api_key = os.getenv("OPENAI_ACCESS")
+# Create an OpenAI client instance (as in your working code)
+client = openai.Client(api_key=os.getenv("OPENAI_ACCESS"))
 
+# Define custom headers to mimic a browser and help prevent blocking by YouTube
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36'
+}
 
-@app.route("/summarize_youtube", methods=["POST"])
+# Create a custom Requests session and update its headers
+custom_session = requests.Session()
+custom_session.headers.update(HEADERS)
+# Monkey-patch the default requests.request so that all calls use our custom headers
+requests.request = custom_session.request
+
+# Hardcoded YouTube URL for testing (use your own video URL here)
+YOUTUBE_URL = "https://www.youtube.com/watch?v=4vIl4G3-yk8"
+
+@app.route("/summarize_youtube", methods=["GET"])  # Using GET since URL is hardcoded
 def summarize_youtube():
     """
-    Expects JSON in the form: { "url": "https://www.youtube.com/watch?v=..." }
-    Returns JSON: {
-      "summary": "...",
-      "tags": "...",
-      "transcript": "...",
-      "error": "...",    # only if something went wrong
-    }
+    Fetches the transcript from a hardcoded YouTube URL, processes it,
+    and returns a summary and tags using OpenAI.
     """
-    data = request.get_json()
-    if not data or "url" not in data:
-        return jsonify({"error": "No 'url' field found in JSON body"}), 400
-    
-    url = data["url"]
-    print("Received URL:", url)
+    print("Using hardcoded YouTube URL:", YOUTUBE_URL)
 
-    # 1) Extract the video ID
-    #    E.g. "https://www.youtube.com/watch?v=4vIl4G3-yk8"
-    #    We'll parse it robustly with the built-in URL library
-    import urllib.parse
-    parsed = urllib.parse.urlparse(url)
+    # 1. Extract Video ID
+    parsed = urllib.parse.urlparse(YOUTUBE_URL)
     video_id = urllib.parse.parse_qs(parsed.query).get("v")
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL or missing ?v= parameter"}), 400
     video_id = video_id[0]
     print("Extracted video ID:", video_id)
 
-    # 2) Get the transcript
+    # 2. Get Transcript (Handling Errors)
     try:
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        print("✅ Transcript successfully retrieved.")
+    except TranscriptsDisabled:
+        return jsonify({"error": "Subtitles are disabled for this video. No transcript is available."}), 400
+    except NoTranscriptFound:
+        return jsonify({"error": "Transcript exists but is not accessible via the API."}), 400
     except Exception as e:
         return jsonify({"error": f"Could not retrieve transcript: {str(e)}"}), 400
 
-    # 3) Combine transcript text
-    output = ""
-    for line in transcript_data:
-        output += line["text"] + "\n"
+    # 3. Combine transcript text
+    transcript_text = "\n".join([line["text"] for line in transcript])
 
-    # 4) Call OpenAI - SUMMARY
+    # 4. Call OpenAI for Summary using "gpt-3.5-turbo" via the client instance
+    summary = "Summary generation failed."
     try:
-        summary_response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # or "gpt-3.5-turbo" / "gpt-4", etc.
+        summary_response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."
-                },
-                {
-                    "role": "assistant",
-                    "content": "Write a 100-word summary of this video."
-                },
-                {
-                    "role": "user",
-                    "content": output
-                }
+                {"role": "system", "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."},
+                {"role": "assistant", "content": "Write a 100-word summary of this video."},
+                {"role": "user", "content": transcript_text}
             ]
         )
-        summary = summary_response.choices[0].message.content
+        summary = summary_response.choices[0].message.content.strip()
+        print("✅ Summary generated.")
     except Exception as e:
-        return jsonify({"error": f"OpenAI Summary request failed: {str(e)}"}), 400
-
-    # 5) Call OpenAI - TAGS
+        print("⚠️ OpenAI Summary API failed:", str(e))
+    
+    # 5. Call OpenAI for Tags using "gpt-3.5-turbo" via the client instance
+    tags = "Tag generation failed."
     try:
-        tags_response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
+        tags_response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."
-                },
-                {
-                    "role": "assistant",
-                    "content": "Output a list of tags for this blog post in a Python list, like ['item1','item2','item3']."
-                },
-                {
-                    "role": "user",
-                    "content": output
-                }
+                {"role": "system", "content": "You are an expert analyst who specializes in summarizing scraped YouTube data."},
+                {"role": "assistant", "content": "Output a list of tags for this blog post in a Python list, like ['item1','item2','item3']."},
+                {"role": "user", "content": transcript_text}
             ]
         )
-        tags = tags_response.choices[0].message.content
+        tags = tags_response.choices[0].message.content.strip()
+        print("✅ Tags generated.")
     except Exception as e:
-        return jsonify({"error": f"OpenAI Tags request failed: {str(e)}"}), 400
+        print("⚠️ OpenAI Tags API failed:", str(e))
 
-    # 6) Return final JSON result
+    # 6. Return JSON result
     return jsonify({
-        "summary": summary.strip(),
-        "tags": tags.strip(),
-        "transcript": output.strip()
+        "summary": summary,
+        "tags": tags,
+        "transcript": transcript_text
     })
 
-
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    port = 5000
+    print(f"🚀 Flask API is running! Open: http://127.0.0.1:{port}/summarize_youtube")
+    app.run(port=port, debug=True)
+
